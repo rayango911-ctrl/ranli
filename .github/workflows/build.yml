@@ -24,7 +24,7 @@ jobs:
 
       - name: Create project files
         run: |
-          mkdir -p app/src/main/java/com/example/voicecall app/src/main/res/mipmap-xxxhdpi
+          mkdir -p app/src/main/java/com/example/voicecall app/src/main/res/mipmap-xxxhdpi app/src/main/res/xml app/src/main/res/values
           cat > settings.gradle.kts << 'EOF_0'
           pluginManagement {
               repositories { google(); mavenCentral(); gradlePluginPortal() }
@@ -111,6 +111,9 @@ jobs:
                           <action android:name="android.intent.action.VOICE_ASSIST" />
                           <category android:name="android.intent.category.DEFAULT" />
                       </intent-filter>
+                      <meta-data
+                          android:name="android.app.shortcuts"
+                          android:resource="@xml/shortcuts" />
                   </activity>
               </application>
           </manifest>
@@ -121,27 +124,130 @@ jobs:
           import android.Manifest
           import android.app.Activity
           import android.app.AlertDialog
+          import android.content.ActivityNotFoundException
+          import android.content.ClipData
+          import android.content.ClipboardManager
+          import android.content.Context
           import android.content.Intent
           import android.content.pm.PackageManager
-          import android.net.Uri
-          import android.os.Bundle
-          import android.provider.ContactsContract
-          import android.speech.RecognitionListener
-          import android.speech.RecognizerIntent
-          import android.speech.SpeechRecognizer
           import android.graphics.Color
           import android.graphics.Typeface
           import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.provider.ContactsContract
+          import android.provider.ContactsContract.CommonDataKinds.Phone
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import android.telecom.TelecomManager
+          import android.telephony.PhoneNumberUtils
+          import android.telephony.TelephonyManager
           import android.view.Gravity
           import android.widget.Button
+          import android.widget.EditText
           import android.widget.LinearLayout
+          import android.widget.ScrollView
           import android.widget.TextView
+          import android.widget.Toast
+          import org.json.JSONArray
+          import org.json.JSONObject
           import java.util.Locale
+
+          // ---------- أنواع البيانات ----------
+
+          private data class Contact(val name: String, val number: String, val label: String)
+          private data class Alias(val alias: String, val contact: String, val messenger: String)
+          private enum class Kind { CALL, WHATSAPP, MESSENGER }
+          private data class Cmd(
+              val kind: Kind,
+              val targets: List<String>,
+              val speaker: Boolean,
+              val number: String?
+          )
+
+          // ---------- أدوات النصوص والمطابقة ----------
+
+          private fun normalize(s: String): String {
+              val sb = StringBuilder()
+              for (c in s) {
+                  sb.append(
+                      when (c) {
+                          in '\u0660'..'\u0669' -> '0' + (c - '\u0660')
+                          in '\u06F0'..'\u06F9' -> '0' + (c - '\u06F0')
+                          'أ', 'إ', 'آ' -> 'ا'
+                          'ة' -> 'ه'
+                          'ى' -> 'ي'
+                          'ؤ' -> 'و'
+                          'ئ' -> 'ي'
+                          else -> c
+                      }
+                  )
+              }
+              return sb.toString()
+                  .replace(Regex("[\\u064B-\\u065F\\u0640]"), "")
+                  .lowercase(Locale.ROOT)
+                  .replace(Regex("[^\\p{L}\\p{N}+\\s]"), " ")
+                  .replace(Regex("\\s+"), " ")
+                  .trim()
+          }
+
+          private fun similarity(a: String, b: String): Double {
+              if (a.isEmpty() || b.isEmpty()) return 0.0
+              val dp = IntArray(b.length + 1) { it }
+              for (i in 1..a.length) {
+                  var prev = dp[0]
+                  dp[0] = i
+                  for (j in 1..b.length) {
+                      val tmp = dp[j]
+                      val cost = if (a[i - 1] == b[j - 1]) 0 else 1
+                      dp[j] = minOf(dp[j] + 1, dp[j - 1] + 1, prev + cost)
+                      prev = tmp
+                  }
+              }
+              return 1.0 - dp[b.length].toDouble() / maxOf(a.length, b.length)
+          }
+
+          private fun score(nameN: String, q: String): Double {
+              if (q.length < 2) return 0.0
+              if (nameN == q) return 1.0
+              if (nameN.contains(q)) return 0.9
+              var best = similarity(nameN, q)
+              for (t in nameN.split(" ")) {
+                  best = maxOf(best, similarity(t, q) * 0.95)
+              }
+              return best
+          }
+
+          private fun variants(n: String): List<String> {
+              val out = mutableListOf(n)
+              if (n.length > 3 && n.startsWith("ل")) out.add(n.substring(1))
+              return out
+          }
+
+          // ---------- الكلمات المفتاحية ----------
+
+          private val triggerRegex = Regex("^(ر+ا?ن+\\S*|ابعت\\S*|ارسل\\S*|اتصل\\S*|كلم\\S*)$")
+          private val whatsappWords = setOf("واتساب", "الواتساب", "واتس", "الواتس", "واتسب", "وتساب", "whatsapp")
+          private val messengerWords = setOf("ماسنجر", "الماسنجر", "مسنجر", "المسنجر", "ماسنجير", "messenger")
+          private val speakerWords = setOf("سبيكر", "السبيكر", "speaker", "مكبر", "المكبر")
+          private val fillerWords = setOf("لي", "على", "ع", "الى", "الي", "رقم", "الرقم", "رساله", "مع")
 
           class MainActivity : Activity() {
 
               private lateinit var status: TextView
+              private lateinit var recentBox: LinearLayout
               private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var pendingListen = false
+              private var chooserDialog: AlertDialog? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private val prefs by lazy { getSharedPreferences("ranli", Context.MODE_PRIVATE) }
 
               private val perms = arrayOf(
                   Manifest.permission.RECORD_AUDIO,
@@ -149,12 +255,17 @@ jobs:
                   Manifest.permission.CALL_PHONE
               )
 
-              // يقبل: رنلي على احمد / رن لي على احمد / ران لي ع احمد / رنلي احمد
-              private val commandRegex =
-                  Regex("""^ر+ا?ن+\S*\s*(?:لي|لى)?\s*(?:(?:على|علي|ع)\s+)?(.+)$""")
+              // ================= الواجهة =================
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
+
+                  tts = TextToSpeech(this) { st ->
+                      if (st == TextToSpeech.SUCCESS) {
+                          val r = tts?.setLanguage(Locale("ar"))
+                          ttsReady = r != TextToSpeech.LANG_MISSING_DATA && r != TextToSpeech.LANG_NOT_SUPPORTED
+                      }
+                  }
 
                   val blue = Color.parseColor("#0A1E78")
                   val purple = Color.parseColor("#5A1C8C")
@@ -194,50 +305,98 @@ jobs:
                       gravity = Gravity.CENTER
                       setPadding(0, 0, 0, 64)
                   }
-                  val btn = Button(this).apply {
-                      text = "🎤 احكي"
-                      textSize = 22f
-                      setTextColor(Color.parseColor("#1A1A2E"))
-                      background = GradientDrawable().apply {
-                          setColor(Color.WHITE)
-                          cornerRadius = 100f
-                      }
-                      setPadding(96, 32, 96, 32)
-                      setOnClickListener { startListening() }
+                  recentBox = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      gravity = Gravity.CENTER_HORIZONTAL
                   }
+
                   val content = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
                       gravity = Gravity.CENTER
                       addView(status)
-                      addView(btn)
+                      addView(pill("🎤 احكي", true) { startCommandListening() })
+                      addView(recentBox)
+                      addView(pill("⚙️ الأسماء المستعارة وماسنجر", false) { showAliases() }, lp(48))
                   }
+                  val scroll = ScrollView(this).apply {
+                      isFillViewport = true
+                      addView(content)
+                  }
+
                   layout.addView(title)
                   layout.addView(slogan)
                   layout.addView(
-                      content,
+                      scroll,
                       LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
                   )
                   setContentView(layout)
+
+                  refreshRecent()
 
                   if (isVoiceLaunch(intent)) handleLaunch(intent)
                   else if (!hasAllPerms()) requestPermissions(perms, 1)
               }
 
-              private var pendingListen = false
+              private fun lp(top: Int = 20): LinearLayout.LayoutParams =
+                  LinearLayout.LayoutParams(
+                      LinearLayout.LayoutParams.WRAP_CONTENT,
+                      LinearLayout.LayoutParams.WRAP_CONTENT
+                  ).apply {
+                      topMargin = top
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  }
 
-              // لما تنفتح الشاشة من ضغطة السماعة (أمر صوتي) نبدأ الاستماع تلقائي
+              private fun pill(label: String, primary: Boolean, onClick: () -> Unit): Button {
+                  val b = Button(this)
+                  b.text = label
+                  b.setAllCaps(false)
+                  b.textSize = if (primary) 22f else 15f
+                  b.setTextColor(if (primary) Color.parseColor("#1A1A2E") else Color.WHITE)
+                  val bg = GradientDrawable()
+                  bg.setColor(if (primary) Color.WHITE else Color.parseColor("#33FFFFFF"))
+                  bg.cornerRadius = 100f
+                  b.background = bg
+                  val h = if (primary) 96 else 48
+                  val v = if (primary) 32 else 16
+                  b.setPadding(h, v, h, v)
+                  b.setOnClickListener { onClick() }
+                  return b
+              }
+
+              private fun refreshRecent() {
+                  recentBox.removeAllViews()
+                  val list = loadRecents()
+                  if (list.isEmpty()) return
+                  val head = TextView(this)
+                  head.text = "آخر المكالمات"
+                  head.setTextColor(Color.parseColor("#CCFFFFFF"))
+                  head.gravity = Gravity.CENTER
+                  head.setPadding(0, 48, 0, 8)
+                  recentBox.addView(head)
+                  for (c in list) {
+                      recentBox.addView(pill("📞 ${c.name}", false) { callContact(c, false) }, lp())
+                  }
+              }
+
+              // ================= إطلاق من السماعة / الاختصار =================
+
+              private fun hasAllPerms() = perms.all {
+                  checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+              }
+
               private fun isVoiceLaunch(i: Intent?): Boolean {
                   val a = i?.action
                   return a == Intent.ACTION_VOICE_COMMAND ||
                       a == Intent.ACTION_ASSIST ||
                       a == "android.intent.action.VOICE_ASSIST" ||
+                      a == "com.example.voicecall.LISTEN" ||
                       i?.getBooleanExtra("autolisten", false) == true
               }
 
               private fun handleLaunch(i: Intent?) {
                   if (!isVoiceLaunch(i)) return
                   if (hasAllPerms()) {
-                      startListening()
+                      startCommandListening()
                   } else {
                       pendingListen = true
                       requestPermissions(perms, 1)
@@ -256,126 +415,522 @@ jobs:
                   super.onRequestPermissionsResult(requestCode, permissions, grantResults)
                   if (pendingListen && hasAllPerms()) {
                       pendingListen = false
-                      startListening()
+                      startCommandListening()
                   }
               }
 
-              private fun hasAllPerms() = perms.all {
-                  checkSelfPermission(it) == PackageManager.PERMISSION_GRANTED
+              // ================= الصوت: نطق واستماع =================
+
+              private fun say(text: String, done: (() -> Unit)? = null) {
+                  status.text = text
+                  if (!ttsReady) {
+                      done?.invoke()
+                      return
+                  }
+                  var finished = false
+                  val finish = Runnable {
+                      if (!finished) {
+                          finished = true
+                          done?.invoke()
+                      }
+                  }
+                  val id = "u" + System.nanoTime()
+                  tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                      override fun onStart(utteranceId: String?) {}
+                      override fun onDone(utteranceId: String?) {
+                          if (utteranceId == id) runOnUiThread(finish)
+                      }
+                      @Deprecated("Deprecated in Java")
+                      override fun onError(utteranceId: String?) {
+                          if (utteranceId == id) runOnUiThread(finish)
+                      }
+                  })
+                  handler.postDelayed(finish, 12000)
+                  tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, id)
               }
 
-              private fun startListening() {
+              // ينطق الجملة ثم ينفذ الإجراء (أو ينفذه بعد 4 ثواني بالأكثر)
+              private fun sayThen(text: String, action: () -> Unit) {
+                  var fired = false
+                  val once = Runnable {
+                      if (!fired) {
+                          fired = true
+                          action()
+                      }
+                  }
+                  handler.postDelayed(once, 4000)
+                  say(text) {
+                      handler.removeCallbacks(once)
+                      once.run()
+                  }
+              }
+
+              private fun startCommandListening() {
+                  listen { options -> handleSpeech(options) }
+              }
+
+              private fun listen(onResult: (List<String>) -> Unit) {
                   if (!hasAllPerms()) {
                       requestPermissions(perms, 1)
                       return
                   }
-                  recognizer?.destroy()
-                  recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
-                      setRecognitionListener(object : RecognitionListener {
-                          override fun onResults(results: Bundle?) {
-                              val list = results
-                                  ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                  ?: return
-                              handleSpeech(list)
-                          }
-                          override fun onError(error: Int) {
-                              status.text = "ما سمعتك، جرب كمان مرة"
-                          }
-                          override fun onReadyForSpeech(p: Bundle?) { status.text = "عم اسمعك..." }
-                          override fun onBeginningOfSpeech() {}
-                          override fun onRmsChanged(rms: Float) {}
-                          override fun onBufferReceived(b: ByteArray?) {}
-                          override fun onEndOfSpeech() {}
-                          override fun onPartialResults(p: Bundle?) {}
-                          override fun onEvent(t: Int, p: Bundle?) {}
-                      })
+                  handler.post {
+                      recognizer?.destroy()
+                      recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                          setRecognitionListener(object : RecognitionListener {
+                              override fun onResults(results: Bundle?) {
+                                  val list = results
+                                      ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                                      ?: return
+                                  onResult(list)
+                              }
+                              override fun onError(error: Int) {
+                                  status.text = "ما سمعتك، جرب كمان مرة"
+                              }
+                              override fun onReadyForSpeech(p: Bundle?) { status.text = "عم اسمعك..." }
+                              override fun onBeginningOfSpeech() {}
+                              override fun onRmsChanged(rms: Float) {}
+                              override fun onBufferReceived(b: ByteArray?) {}
+                              override fun onEndOfSpeech() {}
+                              override fun onPartialResults(p: Bundle?) {}
+                              override fun onEvent(t: Int, p: Bundle?) {}
+                          })
+                      }
+                      val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar-JO") // غيّرها: ar-SA / ar-EG / ar-PS ...
+                          putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
+                      }
+                      recognizer?.startListening(intent)
                   }
-                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                      putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
-                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar-JO") // غيّرها: ar-SA / ar-EG / ar-PS ...
-                      putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3)
-                  }
-                  recognizer?.startListening(intent)
               }
 
-              private fun handleSpeech(options: List<String>) {
-                  // نجرب كل الاحتمالات اللي سمعها التعرف الصوتي
-                  var name: String? = null
-                  for (raw in options) {
-                      val m = commandRegex.find(normalize(raw))
-                      if (m != null) {
-                          name = m.groupValues[1].trim()
+              // ================= فهم الأمر =================
+
+              private fun parseCommand(raw: String): Cmd? {
+                  val tokens = normalize(raw).split(" ").filter { it.isNotEmpty() }
+                  if (tokens.isEmpty() || !triggerRegex.matches(tokens[0])) return null
+
+                  var kind = Kind.CALL
+                  var speaker = false
+                  val rest = ArrayList<String>()
+                  for (t in tokens.drop(1)) {
+                      when {
+                          t in whatsappWords -> kind = Kind.WHATSAPP
+                          t in messengerWords -> kind = Kind.MESSENGER
+                          t in speakerWords -> speaker = true
+                          else -> rest.add(t)
+                      }
+                  }
+                  val full = rest.joinToString(" ")
+                  var trimmed: List<String> = rest
+                  while (trimmed.isNotEmpty()) {
+                      val t = trimmed.first()
+                      if (t in fillerWords || (t == "علي" && trimmed.size >= 2)) {
+                          trimmed = trimmed.drop(1)
+                      } else {
                           break
                       }
                   }
-                  if (name == null) {
+                  val digits = trimmed.joinToString("")
+                  val number = if (Regex("^\\+?\\d{5,}$").matches(digits)) digits else null
+                  val targets = listOf(trimmed.joinToString(" "), full).filter { it.isNotEmpty() }.distinct()
+                  return Cmd(kind, targets, speaker, number)
+              }
+
+              private fun handleSpeech(options: List<String>) {
+                  var cmd: Cmd? = null
+                  for (raw in options) {
+                      cmd = parseCommand(raw)
+                      if (cmd != null) break
+                  }
+                  if (cmd == null) {
                       status.text = "سمعت: \"${options.firstOrNull() ?: ""}\"\nما فهمت الأمر. قل: رنلي على [الاسم]"
                       return
                   }
                   status.text = "سمعت: \"${options.first()}\""
-                  val matches = findContacts(name)
+                  execute(cmd)
+              }
+
+              private fun execute(cmd: Cmd) {
+                  if (cmd.kind == Kind.MESSENGER) {
+                      val al = aliasFor(cmd.targets)
+                      askMessage { msg -> sendMessenger(al?.messenger, msg) }
+                      return
+                  }
+                  if (cmd.targets.isEmpty() && cmd.number == null) {
+                      say("مين بدك؟") {
+                          listen { ans ->
+                              val t = ans.firstOrNull()
+                              val again = if (t == null) null else parseCommand("رنلي $t")
+                              if (again != null) execute(cmd.copy(targets = again.targets, number = again.number))
+                          }
+                      }
+                      return
+                  }
+                  val after: (Contact) -> Unit = { c ->
+                      if (cmd.kind == Kind.WHATSAPP) {
+                          askMessage { msg -> sendWhatsApp(c.number, msg) }
+                      } else {
+                          callContact(c, cmd.speaker)
+                      }
+                  }
+                  val num = cmd.number
+                  if (num != null) {
+                      after(Contact(num, num, ""))
+                      return
+                  }
+                  val found = findContacts(queriesFor(cmd.targets))
                   when {
-                      matches.isEmpty() -> status.text = "ما لقيت \"$name\" بجهات الاتصال"
-                      matches.size == 1 -> call(matches[0])
-                      else -> chooseContact(matches)
+                      found.isEmpty() -> say("ما لقيت ${cmd.targets.first()} بجهات الاتصال")
+                      found.size == 1 -> after(found[0])
+                      else -> chooseContact(found, after)
                   }
               }
 
-              // توحيد الحروف وإزالة التشكيل عشان المطابقة تكون أدق
-              private fun normalize(s: String): String = s
-                  .replace(Regex("[\\u064B-\\u065F\\u0640]"), "")
-                  .replace(Regex("[أإآ]"), "ا")
-                  .replace("ة", "ه")
-                  .replace("ى", "ي")
-                  .lowercase(Locale.ROOT)
-                  .trim()
+              // ================= جهات الاتصال =================
 
-              private data class Contact(val name: String, val number: String)
-
-              private fun findContacts(query: String): List<Contact> {
-                  val q = normalize(query)
-                  val result = LinkedHashMap<String, Contact>() // نشيل الأرقام المكررة
+              private fun loadContacts(): List<Contact> {
+                  val out = ArrayList<Contact>()
                   contentResolver.query(
-                      ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-                      arrayOf(
-                          ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
-                          ContactsContract.CommonDataKinds.Phone.NUMBER
-                      ),
+                      Phone.CONTENT_URI,
+                      arrayOf(Phone.DISPLAY_NAME, Phone.NUMBER, Phone.TYPE, Phone.LABEL),
                       null, null, null
                   )?.use { c ->
                       while (c.moveToNext()) {
                           val name = c.getString(0) ?: continue
                           val number = c.getString(1) ?: continue
-                          if (normalize(name).contains(q)) {
-                              result[number.filter { it.isDigit() || it == '+' }] = Contact(name, number)
+                          val label = try {
+                              Phone.getTypeLabel(resources, c.getInt(2), c.getString(3)).toString()
+                          } catch (e: Exception) {
+                              ""
+                          }
+                          out.add(Contact(name, number, label))
+                      }
+                  }
+                  return out
+              }
+
+              // يحوّل الأسماء المستعارة لأسماء جهات الاتصال الحقيقية
+              private fun queriesFor(targets: List<String>): List<String> {
+                  val out = LinkedHashSet<String>()
+                  val aliases = loadAliases()
+                  for (t in targets) {
+                      val n = normalize(t)
+                      if (n.isEmpty()) continue
+                      for (v in variants(n)) {
+                          val al = aliases.firstOrNull { normalize(it.alias) == v }
+                          if (al != null && al.contact.isNotBlank()) out.add(normalize(al.contact)) else out.add(v)
+                      }
+                  }
+                  return out.toList()
+              }
+
+              private fun aliasFor(targets: List<String>): Alias? {
+                  val aliases = loadAliases()
+                  for (t in targets) {
+                      for (v in variants(normalize(t))) {
+                          val al = aliases.firstOrNull { normalize(it.alias) == v }
+                          if (al != null) return al
+                      }
+                  }
+                  return null
+              }
+
+              private fun findContacts(queries: List<String>): List<Contact> {
+                  if (queries.isEmpty()) return emptyList()
+                  val scored = loadContacts().map { c ->
+                      val nn = normalize(c.name)
+                      Pair(c, queries.maxOf { score(nn, it) })
+                  }
+                  val best = scored.maxOfOrNull { it.second } ?: 0.0
+                  if (best < 0.72) return emptyList()
+                  val cutoff = when {
+                      best >= 1.0 -> 1.0
+                      best >= 0.9 -> 0.9
+                      else -> best - 0.08
+                  }
+                  val seen = HashSet<String>()
+                  return scored
+                      .filter { it.second >= cutoff }
+                      .sortedByDescending { it.second }
+                      .map { it.first }
+                      .filter { seen.add(it.number.filter { ch -> ch.isDigit() }) }
+                      .take(5)
+              }
+
+              // ================= الاختيار بالصوت عند تشابه الأسماء =================
+
+              private fun chooseContact(list: List<Contact>, onChosen: (Contact) -> Unit) {
+                  val opts = list.take(4)
+                  val ordinals = listOf("الأول", "التاني", "التالت", "الرابع")
+                  val labels = opts.map {
+                      val l = if (it.label.isNotBlank()) " - ${it.label}" else ""
+                      "${it.name}$l\n${it.number}"
+                  }
+                  val spoken = "لقيت ${opts.size} جهات. " +
+                      opts.indices.joinToString("، ") { "${ordinals[it]} ${opts[it].name} ${opts[it].label}" } +
+                      ". أي واحد؟"
+
+                  var chosen = false
+                  fun pick(i: Int) {
+                      if (chosen) return
+                      chosen = true
+                      tts?.stop()
+                      recognizer?.cancel()
+                      chooserDialog?.dismiss()
+                      onChosen(opts[i])
+                  }
+
+                  chooserDialog = AlertDialog.Builder(this)
+                      .setTitle("أي واحد؟")
+                      .setItems(labels.toTypedArray()) { _, i -> pick(i) }
+                      .setOnCancelListener {
+                          chosen = true
+                          tts?.stop()
+                          recognizer?.cancel()
+                      }
+                      .create()
+                  chooserDialog?.show()
+
+                  say(spoken) {
+                      if (!chosen) {
+                          listen { answers ->
+                              val idx = parseChoice(answers, opts)
+                              if (idx >= 0) pick(idx) else say("ما فهمت، اختار من الشاشة")
                           }
                       }
                   }
-                  // لو في اسم مطابق تماماً، نفضّله
-                  val exact = result.values.filter { normalize(it.name) == q }
-                  return if (exact.size == 1) exact else result.values.toList()
               }
 
-              private fun chooseContact(list: List<Contact>) {
-                  AlertDialog.Builder(this)
-                      .setTitle("أي واحد؟")
-                      .setItems(list.map { "${it.name}\n${it.number}" }.toTypedArray()) { _, i ->
-                          call(list[i])
+              private fun parseChoice(answers: List<String>, opts: List<Contact>): Int {
+                  for (a in answers) {
+                      val toks = normalize(a).split(" ")
+                      fun has(vararg keys: String): Boolean =
+                          toks.any { t -> keys.any { k -> t.contains(k) } }
+                      if (has("اول", "واحد", "1")) return 0
+                      if (has("ثان", "تاني", "اثني", "2")) return 1
+                      if (has("ثالث", "تالت", "ثلاث", "3")) return 2
+                      if (has("رابع", "اربع", "4")) return 3
+                      val hits = opts.indices.filter { i ->
+                          val on = normalize(opts[i].name + " " + opts[i].label)
+                          toks.any { t -> t.length > 2 && on.contains(t) }
                       }
+                      if (hits.size == 1) return hits[0]
+                  }
+                  return -1
+              }
+
+              // ================= الاتصال والرسائل =================
+
+              private fun callContact(c: Contact, speaker: Boolean) {
+                  addRecent(c)
+                  sayThen("عم اتصل على ${c.name}") {
+                      val i = Intent(Intent.ACTION_CALL, Uri.parse("tel:" + Uri.encode(c.number)))
+                      if (speaker) i.putExtra(TelecomManager.EXTRA_START_CALL_WITH_SPEAKERPHONE, true)
+                      try {
+                          startActivity(i)
+                      } catch (e: SecurityException) {
+                          status.text = "ما في صلاحية الاتصال"
+                      }
+                  }
+              }
+
+              private fun askMessage(onMsg: (String) -> Unit) {
+                  say("شو بدك تقول؟") {
+                      listen { ans ->
+                          val m = ans.firstOrNull()?.trim().orEmpty()
+                          if (m.isNotEmpty()) onMsg(m)
+                      }
+                  }
+              }
+
+              private fun startFirst(vararg intents: Intent): Boolean {
+                  for (i in intents) {
+                      try {
+                          startActivity(i)
+                          return true
+                      } catch (e: ActivityNotFoundException) {
+                          // جرّب اللي بعده
+                      }
+                  }
+                  return false
+              }
+
+              private fun toE164Digits(number: String): String {
+                  val cleaned = number.filter { it.isDigit() || it == '+' }
+                  if (cleaned.startsWith("+")) return cleaned.drop(1)
+                  if (cleaned.startsWith("00")) return cleaned.drop(2)
+                  val tm = getSystemService(Context.TELEPHONY_SERVICE) as TelephonyManager
+                  val iso = tm.simCountryIso?.takeIf { it.isNotBlank() }?.uppercase()
+                      ?: Locale.getDefault().country
+                  val e164 = PhoneNumberUtils.formatNumberToE164(cleaned, iso)
+                  return (e164 ?: cleaned).filter { it.isDigit() }
+              }
+
+              private fun sendWhatsApp(number: String, msg: String) {
+                  val uri = Uri.parse("https://wa.me/" + toE164Digits(number) + "?text=" + Uri.encode(msg))
+                  val ok = startFirst(
+                      Intent(Intent.ACTION_VIEW, uri).setPackage("com.whatsapp"),
+                      Intent(Intent.ACTION_VIEW, uri).setPackage("com.whatsapp.w4b"),
+                      Intent(Intent.ACTION_VIEW, uri)
+                  )
+                  if (ok) {
+                      Toast.makeText(this, "اضغط إرسال بالواتساب", Toast.LENGTH_LONG).show()
+                  } else {
+                      say("ما لقيت الواتساب")
+                  }
+              }
+
+              private fun sendMessenger(username: String?, msg: String) {
+                  val cm = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                  cm.setPrimaryClip(ClipData.newPlainText("msg", msg))
+                  val ok: Boolean
+                  if (!username.isNullOrBlank()) {
+                      val uri = Uri.parse("https://m.me/$username")
+                      ok = startFirst(
+                          Intent(Intent.ACTION_VIEW, uri).setPackage("com.facebook.orca"),
+                          Intent(Intent.ACTION_VIEW, uri).setPackage("com.facebook.mlite"),
+                          Intent(Intent.ACTION_VIEW, uri)
+                      )
+                      if (ok) Toast.makeText(this, "تم نسخ الرسالة. الصقها بالمحادثة وأرسل", Toast.LENGTH_LONG).show()
+                  } else {
+                      val send = Intent(Intent.ACTION_SEND)
+                      send.type = "text/plain"
+                      send.putExtra(Intent.EXTRA_TEXT, msg)
+                      val s1 = Intent(send).setPackage("com.facebook.orca")
+                      val s2 = Intent(send).setPackage("com.facebook.mlite")
+                      ok = startFirst(s1, s2)
+                      if (ok) Toast.makeText(this, "اختار الشخص ثم اضغط إرسال", Toast.LENGTH_LONG).show()
+                  }
+                  if (!ok) say("ما لقيت تطبيق الماسنجر")
+              }
+
+              // ================= المخزن: آخر المكالمات والأسماء المستعارة =================
+
+              private fun loadRecents(): List<Contact> {
+                  val s = prefs.getString("recents", null) ?: return emptyList()
+                  return try {
+                      val a = JSONArray(s)
+                      (0 until a.length()).map {
+                          val o = a.getJSONObject(it)
+                          Contact(o.getString("n"), o.getString("p"), o.optString("l"))
+                      }
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+              }
+
+              private fun addRecent(c: Contact) {
+                  val list = (listOf(c) + loadRecents().filter { it.number != c.number }).take(3)
+                  val a = JSONArray()
+                  for (x in list) {
+                      a.put(JSONObject().put("n", x.name).put("p", x.number).put("l", x.label))
+                  }
+                  prefs.edit().putString("recents", a.toString()).apply()
+                  refreshRecent()
+              }
+
+              private fun loadAliases(): List<Alias> {
+                  val s = prefs.getString("aliases", null) ?: return emptyList()
+                  return try {
+                      val a = JSONArray(s)
+                      (0 until a.length()).map {
+                          val o = a.getJSONObject(it)
+                          Alias(o.getString("a"), o.optString("c"), o.optString("m"))
+                      }
+                  } catch (e: Exception) {
+                      emptyList()
+                  }
+              }
+
+              private fun saveAliases(list: List<Alias>) {
+                  val a = JSONArray()
+                  for (x in list) {
+                      a.put(JSONObject().put("a", x.alias).put("c", x.contact).put("m", x.messenger))
+                  }
+                  prefs.edit().putString("aliases", a.toString()).apply()
+              }
+
+              private fun showAliases() {
+                  val list = loadAliases()
+                  val msg = if (list.isEmpty()) {
+                      "ما في أسماء مستعارة بعد.\nمثال: الشيخ ← أبو محمد"
+                  } else {
+                      list.joinToString("\n") {
+                          val c = if (it.contact.isBlank()) "-" else it.contact
+                          val m = if (it.messenger.isBlank()) "" else "  (ماسنجر: ${it.messenger})"
+                          "• ${it.alias} ← $c$m"
+                      }
+                  }
+                  AlertDialog.Builder(this)
+                      .setTitle("الأسماء المستعارة")
+                      .setMessage(msg)
+                      .setPositiveButton("إضافة") { _, _ -> showAddAlias() }
+                      .setNeutralButton("مسح الكل") { _, _ -> saveAliases(emptyList()) }
+                      .setNegativeButton("إغلاق", null)
                       .show()
               }
 
-              private fun call(contact: Contact) {
-                  status.text = "عم اتصل على ${contact.name}..."
-                  startActivity(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(contact.number)}")))
+              private fun showAddAlias() {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(48, 16, 48, 0)
+                  val fAlias = EditText(this)
+                  fAlias.hint = "الاسم اللي بتقوله (مثلاً: الشيخ)"
+                  val fContact = EditText(this)
+                  fContact.hint = "اسم جهة الاتصال (اختياري)"
+                  val fMsgr = EditText(this)
+                  fMsgr.hint = "معرّف ماسنجر أو رابطه (اختياري)"
+                  box.addView(fAlias)
+                  box.addView(fContact)
+                  box.addView(fMsgr)
+                  AlertDialog.Builder(this)
+                      .setTitle("إضافة اسم مستعار")
+                      .setView(box)
+                      .setPositiveButton("حفظ") { _, _ ->
+                          val a = fAlias.text.toString().trim()
+                          if (a.isNotEmpty()) {
+                              val m = fMsgr.text.toString().trim().trimEnd('/')
+                                  .substringAfterLast('/').substringBefore('?')
+                              val kept = loadAliases().filter { normalize(it.alias) != normalize(a) }
+                              saveAliases(kept + Alias(a, fContact.text.toString().trim(), m))
+                          }
+                          showAliases()
+                      }
+                      .setNegativeButton("إلغاء", null)
+                      .show()
               }
 
               override fun onDestroy() {
                   recognizer?.destroy()
+                  tts?.shutdown()
                   super.onDestroy()
               }
           }
           EOF_5
+          cat > app/src/main/res/xml/shortcuts.xml << 'EOF_6'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+              <shortcut
+                  android:shortcutId="listen"
+                  android:enabled="true"
+                  android:icon="@mipmap/ic_launcher"
+                  android:shortcutShortLabel="@string/shortcut_listen"
+                  android:shortcutLongLabel="@string/shortcut_listen">
+                  <intent
+                      android:action="com.example.voicecall.LISTEN"
+                      android:targetPackage="com.example.voicecall"
+                      android:targetClass="com.example.voicecall.MainActivity" />
+              </shortcut>
+          </shortcuts>
+          EOF_6
+          cat > app/src/main/res/values/strings.xml << 'EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="shortcut_listen">احكي</string>
+          </resources>
+          EOF_7
           base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png << 'EOF_ICON'
           iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABIFBMVEX+/P759v318f3s5fvh1vva
           y/zSxPbBrvGNcs5sOtt3KPtlKfBiHPZHF9o7Go0iF0wZEjsbEEQRESUPDyEODx8qDIYbDEsVDDcR
@@ -478,171 +1033,4 @@ jobs:
           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
-          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
-          SUVORK5CYII=
-          EOF_ICON
-
-      - name: Build debug APK
-        run: gradle assembleDebug --no-daemon
-
-      - name: Publish APK as release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          cp app/build/outputs/apk/debug/app-debug.apk ranli.apk
-          gh release create "v${{ github.run_number }}" ranli.apk --title "Ranli v${{ github.run_number }}" --notes "Debug APK"
+          BbL6bndgtk1MW0NB6Xwqnc1n87ujMfl
