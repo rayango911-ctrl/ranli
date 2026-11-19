@@ -180,6 +180,13 @@ jobs:
                       gravity = Gravity.CENTER
                       setPadding(0, 96, 0, 0)
                   }
+                  val slogan = TextView(this).apply {
+                      text = "مع ريان حمل نقلتك بأمان"
+                      textSize = 18f
+                      setTextColor(Color.parseColor("#E6FFFFFF"))
+                      gravity = Gravity.CENTER
+                      setPadding(0, 16, 0, 0)
+                  }
                   status = TextView(this).apply {
                       text = "اضغط الزر وقل: رنلي على [الاسم]"
                       textSize = 18f
@@ -205,6 +212,7 @@ jobs:
                       addView(btn)
                   }
                   layout.addView(title)
+                  layout.addView(slogan)
                   layout.addView(
                       content,
                       LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f)
