@@ -55,7 +55,7 @@ jobs:
               compileSdk = 34
               defaultConfig {
                   applicationId = "com.example.voicecall"
-                  minSdk = 24
+                  minSdk = 27
                   targetSdk = 34
                   versionCode = 1
                   versionName = "1.0"
@@ -89,10 +89,26 @@ jobs:
 
                   <activity
                       android:name=".MainActivity"
-                      android:exported="true">
+                      android:exported="true"
+                      android:launchMode="singleTop"
+                      android:showWhenLocked="true"
+                      android:turnScreenOn="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
                           <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                      <!-- ضغطة السماعة الطويلة (أمر صوتي) -->
+                      <intent-filter>
+                          <action android:name="android.intent.action.VOICE_COMMAND" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.ASSIST" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                      <intent-filter>
+                          <action android:name="android.intent.action.VOICE_ASSIST" />
+                          <category android:name="android.intent.category.DEFAULT" />
                       </intent-filter>
                   </activity>
               </application>
@@ -155,7 +171,45 @@ jobs:
                   layout.addView(btn)
                   setContentView(layout)
 
-                  if (!hasAllPerms()) requestPermissions(perms, 1)
+                  if (isVoiceLaunch(intent)) handleLaunch(intent)
+                  else if (!hasAllPerms()) requestPermissions(perms, 1)
+              }
+
+              private var pendingListen = false
+
+              // لما تنفتح الشاشة من ضغطة السماعة (أمر صوتي) نبدأ الاستماع تلقائي
+              private fun isVoiceLaunch(i: Intent?): Boolean {
+                  val a = i?.action
+                  return a == Intent.ACTION_VOICE_COMMAND ||
+                      a == Intent.ACTION_ASSIST ||
+                      a == "android.intent.action.VOICE_ASSIST" ||
+                      i?.getBooleanExtra("autolisten", false) == true
+              }
+
+              private fun handleLaunch(i: Intent?) {
+                  if (!isVoiceLaunch(i)) return
+                  if (hasAllPerms()) {
+                      startListening()
+                  } else {
+                      pendingListen = true
+                      requestPermissions(perms, 1)
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleLaunch(intent)
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int, permissions: Array<out String>, grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (pendingListen && hasAllPerms()) {
+                      pendingListen = false
+                      startListening()
+                  }
               }
 
               private fun hasAllPerms() = perms.all {
