@@ -129,8 +129,9 @@ jobs:
                   Manifest.permission.CALL_PHONE
               )
 
-              // الأمر: "رنلي على احمد" أو "رنلي ع احمد"
-              private val commandRegex = Regex("""رنلي\s+(?:على|ع)\s+(.+)""")
+              // يقبل: رنلي على احمد / رن لي على احمد / ران لي ع احمد / رنلي احمد
+              private val commandRegex =
+                  Regex("""^ر+ا?ن+\S*\s*(?:لي|لى)?\s*(?:(?:على|علي|ع)\s+)?(.+)$""")
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -170,10 +171,10 @@ jobs:
                   recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
                       setRecognitionListener(object : RecognitionListener {
                           override fun onResults(results: Bundle?) {
-                              val text = results
+                              val list = results
                                   ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                                  ?.firstOrNull() ?: return
-                              handleSpeech(text)
+                                  ?: return
+                              handleSpeech(list)
                           }
                           override fun onError(error: Int) {
                               status.text = "ما سمعتك، جرب كمان مرة"
@@ -195,14 +196,21 @@ jobs:
                   recognizer?.startListening(intent)
               }
 
-              private fun handleSpeech(raw: String) {
-                  status.text = raw
-                  val match = commandRegex.find(normalize(raw))
-                  if (match == null) {
-                      status.text = "\"$raw\"\nما فهمت الأمر. قل: رنلي على [الاسم]"
+              private fun handleSpeech(options: List<String>) {
+                  // نجرب كل الاحتمالات اللي سمعها التعرف الصوتي
+                  var name: String? = null
+                  for (raw in options) {
+                      val m = commandRegex.find(normalize(raw))
+                      if (m != null) {
+                          name = m.groupValues[1].trim()
+                          break
+                      }
+                  }
+                  if (name == null) {
+                      status.text = "سمعت: \"${options.firstOrNull() ?: ""}\"\nما فهمت الأمر. قل: رنلي على [الاسم]"
                       return
                   }
-                  val name = match.groupValues[1].trim()
+                  status.text = "سمعت: \"${options.first()}\""
                   val matches = findContacts(name)
                   when {
                       matches.isEmpty() -> status.text = "ما لقيت \"$name\" بجهات الاتصال"
