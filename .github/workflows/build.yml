@@ -83,7 +83,7 @@ jobs:
               </queries>
 
               <application
-                  android:label="مساعدك ريان"
+                  android:label="رنلي"
                   android:icon="@mipmap/ic_launcher"
                   android:supportsRtl="true"
                   android:theme="@android:style/Theme.Material.NoActionBar">
