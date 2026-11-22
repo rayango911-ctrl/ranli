@@ -1,42 +1,21 @@
 name: Build APK
 on:
   push:
-    branches: ["**"]
   workflow_dispatch:
-
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Unpack project
-        run: unzip -o project.zip
-
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: 17
-
-      - uses: gradle/actions/setup-gradle@v4
+      - uses: gradle/actions/setup-gradle@v3
         with:
           gradle-version: 8.9
-
-      - name: Build debug APK
-        run: |
-          for i in 1 2 3 4; do
-            gradle assembleDebug --no-daemon && exit 0
-            echo "Attempt $i failed, waiting before retry..."
-            sleep 90
-          done
-          exit 1
-
-      - name: Publish APK as release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          cp app/build/outputs/apk/debug/app-debug.apk ranli.apk
-          gh release create "v${{ github.run_number }}" ranli.apk --title "Ranli v${{ github.run_number }}" --notes "Debug APK"
+      - run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prayer-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
