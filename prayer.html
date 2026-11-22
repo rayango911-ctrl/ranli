@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>مذكّر الصلاة</title>
+<style>
+:root{--bg:#f6f4ee;--card:#fff;--tx:#1d2b24;--mut:#6b7a72;--pri:#1f7a5a;--prit:#fff;--warn:#b8860b;--bd:#ddd8c8;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){--bg:#101a15;--card:#192520;--tx:#e8efe9;--mut:#93a39a;--pri:#3fae85;--prit:#06140e;--warn:#e0b341;--bd:#2c3b33}}
+:root[data-theme="dark"]{--bg:#101a15;--card:#192520;--tx:#e8efe9;--mut:#93a39a;--pri:#3fae85;--prit:#06140e;--warn:#e0b341;--bd:#2c3b33}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--tx);font-family:system-ui,-apple-system,"Segoe UI",Tahoma,sans-serif;padding:16px;max-width:520px;margin-inline:auto}
+h1{font-size:22px;margin:8px 0 12px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:14px;padding:14px;margin-bottom:12px}
+.card h2{font-size:15px;margin:0 0 10px;color:var(--mut)}
+.row{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:6px 0}
+input[type=time]{font-size:16px;padding:6px 8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx)}
+.chips{display:flex;flex-wrap:wrap;gap:8px}
+.chip{padding:8px 12px;border-radius:20px;border:1px solid var(--bd);background:var(--bg);color:var(--tx);font-size:14px}
+.chip.on{background:var(--pri);color:var(--prit);border-color:var(--pri)}
+button{font:inherit;cursor:pointer}
+.btn{width:100%;padding:14px;border-radius:12px;border:0;font-size:17px;font-weight:600;margin-top:10px}
+.p{background:var(--pri);color:var(--prit)}
+.s{background:transparent;color:var(--tx);border:1px solid var(--bd)}
+.ov{position:fixed;inset:0;z-index:10;display:none;flex-direction:column;align-items:center;justify-content:center;text-align:center;padding:24px;background:var(--bg)}
+.ov.show{display:flex}
+.big{font-size:56px;font-weight:700;margin:10px 0;font-variant-numeric:tabular-nums}
+.ov .btn{max-width:360px}
+#lock{background:#0b0f0d;color:#fff}
+.status{color:var(--mut);font-size:14px;margin-top:6px}
+.add{display:flex;gap:8px;margin-top:10px}
+.add input{flex:1;padding:8px;border:1px solid var(--bd);border-radius:8px;background:var(--bg);color:var(--tx);font-size:15px}
+.add button{padding:8px 14px;border-radius:8px;border:1px solid var(--bd);background:var(--bg);color:var(--tx)}
+.note{font-size:12.5px;color:var(--mut);line-height:1.6}
+</style>
+</head>
+<body>
+<h1>🕌 مذكّر الصلاة</h1>
+
+<div class="card">
+  <h2>مواعيد الصلاة اليوم، عمّان 🇯🇴 (حساب تلقائي، فجر وعشاء 18°)</h2>
+  <div id="times"></div>
+</div>
+
+<div class="card">
+  <h2>التطبيقات اللي بدك تنقفل وقت الصلاة</h2>
+  <div class="chips" id="apps"></div>
+  <div class="add"><input id="newApp" placeholder="أضف تطبيق"><button id="addBtn">إضافة</button></div>
+</div>
+
+<div class="card">
+  <button class="btn p" id="enable" style="margin-top:0">تفعيل التنبيهات والصوت</button>
+  <div class="row" style="margin-top:12px"><span>وضع تجربة (الدقيقة = ثانية)</span><input type="checkbox" id="test"></div>
+  <div class="row"><span>ذكر كل 5 دقايق (صلِّ على النبي، أستغفر الله)</span><input type="checkbox" id="dhikr"></div>
+  <button class="btn s" id="try">جرّب الآن</button>
+  <div class="status" id="status"></div>
+  <p class="note">لازم تترك هالصفحة مفتوحة وشاشتك شغالة عشان يرن. التطبيقات الحقيقية ما بتنقفل من صفحة ويب، بتظهر شاشة قفل تغطي كل شي.</p>
+</div>
+
+<div class="ov" id="ring">
+  <div style="font-size:52px">🕌</div>
+  <div class="big" id="ringName" style="font-size:34px"></div>
+  <div class="status" id="ringSub"></div>
+  <button class="btn p" id="go">يلا هسه بقوم</button>
+  <button class="btn s" id="later">كمان ربع ساعة</button>
+</div>
+
+<div class="ov" id="lock">
+  <div style="font-size:44px">🔒</div>
+  <div style="font-size:20px">قوم صلّي</div>
+  <div class="big" id="lockTime">7:00</div>
+  <div class="status" id="lockApps" style="color:#aab"></div>
+</div>
+
+<script>
+const PRAYERS=[["الفجر"],["الظهر"],["العصر"],["المغرب"],["العشاء"]];
+let lastDay="",tc={day:"",t:{}},nextD=0;
+function ammanNow(){
+ const f=new Intl.DateTimeFormat("en-GB",{timeZone:"Asia/Amman",year:"numeric",month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit",hourCycle:"h23"});
+ const p={};f.formatToParts(new Date()).forEach(x=>p[x.type]=x.value);
+ const off=Math.round((Date.UTC(p.year,p.month-1,p.day,p.hour,p.minute)-Math.floor(Date.now()/60000)*60000)/36e5);
+ return {y:+p.year,m:+p.month,d:+p.day,hm:p.hour+":"+p.minute,day:p.year+"-"+p.month+"-"+p.day,off};
+}
+function todayTimes(){
+ const A=ammanNow();if(tc.day===A.day)return tc.t;
+ const R=Math.PI/180,lat=31.9539,lng=35.9106;
+ const d=Date.UTC(A.y,A.m-1,A.d,12)/864e5+2440587.5-2451545;
+ const g=(357.529+0.98560028*d)%360,q=(280.459+0.98564736*d)%360;
+ const L=q+1.915*Math.sin(g*R)+0.02*Math.sin(2*g*R),e=23.439-3.6e-7*d;
+ let RA=Math.atan2(Math.cos(e*R)*Math.sin(L*R),Math.cos(L*R))/R/15;RA=((RA%24)+24)%24;
+ const dec=Math.asin(Math.sin(e*R)*Math.sin(L*R))/R;
+ const eq=((q/15-RA+12)%24+24)%24-12;
+ const noon=12+A.off-lng/15-eq;
+ const den=Math.cos(dec*R)*Math.cos(lat*R),sn=Math.sin(dec*R)*Math.sin(lat*R);
+ const T=a=>Math.acos((-Math.sin(a*R)-sn)/den)/R/15;
+ const asrA=Math.atan(1/(1+Math.tan(Math.abs(lat-dec)*R)))/R;
+ const ta=Math.acos((Math.sin(asrA*R)-sn)/den)/R/15;
+ const fm=h=>{const m=Math.round((((h%24)+24)%24)*60);return String(Math.floor(m/60)%24).padStart(2,"0")+":"+String(m%60).padStart(2,"0")};
+ tc={day:A.day,t:{"الفجر":fm(noon-T(18)),"الظهر":fm(noon),"العصر":fm(noon+ta),"المغرب":fm(noon+T(0.833)+4/60),"العشاء":fm(noon+T(18))}};
+ return tc.t;
+}
+function disp(t){let [h,m]=t.split(":").map(Number);const s=h>=12?"م":"ص";h=h%12||12;return (h+":"+String(m).padStart(2,"0")).replace(/\d/g,d=>"٠١٢٣٤٥٦٧٨٩"[d])+" "+s}
+function say(t){try{const u=new SpeechSynthesisUtterance(t);u.lang="ar-SA";u.rate=.9;speechSynthesis.speak(u)}catch(e){}}
+function dhikrTick(){
+ if(cfg.dhikr===false){nextD=0;return}
+ const now=Date.now();
+ if(!nextD){nextD=now+5*unit();return}
+ if(now>=nextD){nextD=now+5*unit();if(st.phase!=="ringing"){say("صَلِّ على النبي");say("أستغفر الله")}}
+}
+const DEF_APPS=["Instagram","TikTok","YouTube","WhatsApp","Facebook","Snapchat","X"];
+let cfg={times:{},apps:{},test:false};
+let st={phase:"idle",snoozes:0,until:0,prayer:""};
+const $=id=>document.getElementById(id);
+function load(){try{const c=JSON.parse(localStorage.getItem("pr_cfg")||"null");if(c)cfg=c}catch(e){}
+ 
+ DEF_APPS.forEach(a=>{if(!(a in cfg.apps))cfg.apps[a]=false});}
+function save(){try{localStorage.setItem("pr_cfg",JSON.stringify(cfg))}catch(e){}}
+const unit=()=>cfg.test?1000:60000;
+const SNOOZE=15,LOCK=7;
+
+function renderCfg(){
+ $("times").innerHTML="";
+ PRAYERS.forEach(([n])=>{
+  const r=document.createElement("div");r.className="row";
+  r.innerHTML=`<span>${n}</span>`;
+  const i=document.createElement("b");i.textContent=disp(todayTimes()[n]);
+  r.appendChild(i);$("times").appendChild(r);
+ });
+ $("apps").innerHTML="";
+ Object.keys(cfg.apps).forEach(a=>{
+  const b=document.createElement("button");b.className="chip"+(cfg.apps[a]?" on":"");b.textContent=a;
+  b.onclick=()=>{cfg.apps[a]=!cfg.apps[a];save();renderCfg()};
+  $("apps").appendChild(b);
+ });
+ $("test").checked=cfg.test;$("dhikr").checked=cfg.dhikr!==false;
+}
+const selected=()=>Object.keys(cfg.apps).filter(a=>cfg.apps[a]);
+
+/* sound */
+let ac=null,beepT=null;
+function unlock(){try{ac=ac||new (window.AudioContext||window.webkitAudioContext)();ac.resume()}catch(e){}}
+function beep(){if(!ac)return;try{const o=ac.createOscillator(),g=ac.createGain();o.frequency.value=660;g.gain.value=.25;o.connect(g);g.connect(ac.destination);o.start();o.stop(ac.currentTime+.45)}catch(e){}
+ try{navigator.vibrate&&navigator.vibrate([300,150,300])}catch(e){}}
+function startRing(){stopRing();beep();beepT=setInterval(beep,1500)}
+function stopRing(){if(beepT){clearInterval(beepT);beepT=null}}
+function notify(t){try{if("Notification" in window&&Notification.permission==="granted")new Notification(t)}catch(e){}}
+
+/* flow */
+function ring(){
+ st.phase="ringing";
+ $("ringName").textContent="حان وقت صلاة "+st.prayer;
+ $("ringSub").textContent=st.snoozes===0?"اختر":(st.snoozes===1?"أجّلت مرة. إذا أجّلت كمان مرة، بتنقفل التطبيقات بعد ربع ساعة":"");
+ $("later").style.display=st.snoozes>=2?"none":"block";
+ $("ring").classList.add("show");
+ startRing();notify("حان وقت صلاة "+st.prayer);
+}
+function snooze(){
+ stopRing();$("ring").classList.remove("show");
+ st.snoozes++;st.phase="snoozing";st.until=Date.now()+SNOOZE*unit();
+}
+function lock(){
+ stopRing();$("ring").classList.remove("show");
+ st.phase="locked";st.until=Date.now()+LOCK*unit();
+ const a=selected();
+ $("lockApps").textContent=a.length?"مقفولة الآن: "+a.join("، "):"ما اخترت تطبيقات";
+ $("lock").classList.add("show");
+}
+function fire(name){if(st.phase!=="idle")return;st={phase:"idle",snoozes:0,until:0,prayer:name};ring()}
+function fmt(ms){const s=Math.max(0,Math.ceil(ms/1000)),m=Math.floor(s/60);return m+":"+String(s%60).padStart(2,"0")}
+
+function tick(){
+ const A=ammanNow(),hm=A.hm;if(A.day!==lastDay){lastDay=A.day;renderCfg()}
+ const day=A.day;
+ if(st.phase==="idle"){
+  for(const [n] of PRAYERS){
+   if(todayTimes()[n]===hm){
+    const k="pr_"+n+day;let done=false;
+    try{done=localStorage.getItem(k)}catch(e){}
+    if(!done){try{localStorage.setItem(k,"1")}catch(e){}fire(n);break}
+   }
+  }
+ }else if(st.phase==="snoozing"&&Date.now()>=st.until){
+  if(st.snoozes>=2)lock();else ring();
+ }else if(st.phase==="locked"){
+  if(Date.now()>=st.until){st.phase="idle";$("lock").classList.remove("show")}
+  else $("lockTime").textContent=fmt(st.until-Date.now());
+ }
+ dhikrTick();let s="جاهز";
+ if(st.phase==="snoozing")s="تذكير بعد "+fmt(st.until-Date.now());
+ if(st.phase==="locked")s="التطبيقات مقفولة";
+ $("status").textContent=s;
+}
+
+$("enable").onclick=()=>{unlock();say("تم التفعيل");try{Notification&&Notification.requestPermission()}catch(e){}$("enable").textContent="تم التفعيل ✓"};
+$("try").onclick=()=>{unlock();fire("تجريبية")};
+$("later").onclick=snooze;
+$("go").onclick=lock;
+$("test").onchange=e=>{cfg.test=e.target.checked;nextD=0;save()};
+$("dhikr").onchange=e=>{cfg.dhikr=e.target.checked;nextD=0;save()};
+$("addBtn").onclick=()=>{const v=$("newApp").value.trim();if(v&&!(v in cfg.apps)){cfg.apps[v]=true;$("newApp").value="";save();renderCfg()}};
+
+load();renderCfg();tick();setInterval(tick,1000);
+</script>
+</body>
+</html>
