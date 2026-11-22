@@ -30,7 +30,10 @@ jobs:
               id("org.jetbrains.kotlin.android") version "1.9.24" apply false
           }
           EOF
-          printf 'org.gradle.jvmargs=-Xmx2g\nandroid.nonTransitiveRClass=true\n' > gradle.properties
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.nonTransitiveRClass=true
+          EOF
           cat > app/build.gradle.kts <<'EOF'
           plugins {
               id("com.android.application")
@@ -63,4 +66,241 @@ jobs:
           <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
               android:accessibilityEventTypes="typeWindowStateChanged"
               android:accessibilityFeedbackType="feedbackGeneric"
-              an
+              android:canRetrieveWindowContent="false"
+              android:notificationTimeout="100"
+              android:description="@string/acc_desc" />
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+              <uses-permission android:name="android.permission.WAKE_LOCK"/>
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>
+              <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS"/>
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN"/>
+                      <category android:name="android.intent.category.LAUNCHER"/>
+                  </intent>
+              </queries>
+              <application android:label="@string/app_name" android:allowBackup="false">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN"/>
+                          <category android:name="android.intent.category.LAUNCHER"/>
+                      </intent-filter>
+                  </activity>
+                  <service android:name=".PrayerService" android:exported="false"/>
+                  <service android:name=".BlockerService" android:exported="true"
+                      android:label="@string/app_name"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+                      <intent-filter><action android:name="android.accessibilityservice.AccessibilityService"/></intent-filter>
+                      <meta-data android:name="android.accessibilityservice" android:resource="@xml/accessibility"/>
+                  </service>
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED"/></intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+          cat > app/src/main/java/com/prayer/reminder/App.kt <<'EOF'
+          package com.prayer.reminder
+
+          import android.accessibilityservice.AccessibilityService
+          import android.app.*
+          import android.content.*
+          import android.media.*
+          import android.net.Uri
+          import android.os.*
+          import android.provider.Settings
+          import android.speech.tts.TextToSpeech
+          import android.view.View
+          import android.view.accessibility.AccessibilityEvent
+          import android.widget.*
+          import java.time.*
+          import java.util.Locale
+          import kotlin.math.*
+
+          val NAMES = arrayOf("الفجر", "الظهر", "العصر", "المغرب", "العشاء")
+          val AMMAN: ZoneId = ZoneId.of("Asia/Amman")
+
+          object PT {
+              // returns minutes from midnight: fajr, dhuhr, asr, maghrib, isha (Amman)
+              fun compute(date: LocalDate): IntArray {
+                  val R = PI / 180; val lat = 31.9539; val lng = 35.9106
+                  val off = date.atTime(12, 0).atZone(AMMAN).offset.totalSeconds / 3600.0
+                  val d = (date.toEpochDay() - 10957).toDouble()
+                  val g = (357.529 + 0.98560028 * d) % 360
+                  val q = (280.459 + 0.98564736 * d) % 360
+                  val L = q + 1.915 * sin(g * R) + 0.02 * sin(2 * g * R)
+                  val e = 23.439 - 3.6e-7 * d
+                  var ra = atan2(cos(e * R) * sin(L * R), cos(L * R)) / R / 15
+                  ra = ((ra % 24) + 24) % 24
+                  val dec = asin(sin(e * R) * sin(L * R)) / R
+                  val eq = ((q / 15 - ra + 12) % 24 + 24) % 24 - 12
+                  val noon = 12 + off - lng / 15 - eq
+                  val den = cos(dec * R) * cos(lat * R); val sn = sin(dec * R) * sin(lat * R)
+                  fun t(a: Double) = acos((-sin(a * R) - sn) / den) / R / 15
+                  val asrA = atan(1 / (1 + tan(abs(lat - dec) * R))) / R
+                  val ta = acos((sin(asrA * R) - sn) / den) / R / 15
+                  fun m(h: Double) = Math.round((((h % 24) + 24) % 24) * 60).toInt() % 1440
+                  return intArrayOf(m(noon - t(18.0)), m(noon), m(noon + ta), m(noon + t(0.833) + 4 / 60.0), m(noon + t(18.0)))
+              }
+              fun fmt(m: Int): String {
+                  val h = m / 60; val s = if (h >= 12) "م" else "ص"
+                  val h12 = if (h % 12 == 0) 12 else h % 12
+                  return "%d:%02d".format(h12, m % 60).map { if (it in '0'..'9') '٠' + (it - '0') else it }.joinToString("") + " " + s
+              }
+          }
+
+          class PrayerService : Service() {
+              companion object { const val GO = "go"; const val LATER = "later"; const val TEST = "test" }
+              private val h = Handler(Looper.getMainLooper())
+              private var phase = "idle"; private var snoozes = 0; private var until = 0L
+              private var prayer = ""; private var nextD = 0L
+              private var tts: TextToSpeech? = null; private var ttsOk = false
+              private var player: MediaPlayer? = null
+              private val fired = HashSet<String>()
+              private fun nm() = getSystemService(NotificationManager::class.java)
+              private fun prefs() = getSharedPreferences("p", 0)
+
+              override fun onBind(i: Intent?): IBinder? = null
+
+              override fun onCreate() {
+                  super.onCreate()
+                  nm().createNotificationChannel(NotificationChannel("s", "الخدمة", NotificationManager.IMPORTANCE_LOW))
+                  nm().createNotificationChannel(NotificationChannel("a", "الأذان", NotificationManager.IMPORTANCE_HIGH).apply { setSound(null, null) })
+                  getSystemService(PowerManager::class.java).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "prayer:w").acquire()
+                  tts = TextToSpeech(this) { if (it == TextToSpeech.SUCCESS) { tts?.language = Locale("ar"); ttsOk = true } }
+                  startForeground(1, notif("مذكّر الصلاة شغال", "s", false))
+                  h.post(tick)
+              }
+
+              private val tick = object : Runnable {
+                  override fun run() { try { step() } catch (e: Exception) {}; h.postDelayed(this, 1000) }
+              }
+
+              private fun pi(a: String) = PendingIntent.getService(this, a.hashCode(), Intent(this, PrayerService::class.java).setAction(a),
+                  PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
+
+              private fun notif(text: String, ch: String, actions: Boolean): Notification {
+                  val b = Notification.Builder(this, ch).setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                      .setContentTitle("مذكّر الصلاة").setContentText(text).setOngoing(true)
+                  if (actions) {
+                      b.addAction(0, "يلا هسه بقوم", pi(GO))
+                      if (snoozes < 2) b.addAction(0, "كمان ربع ساعة", pi(LATER))
+                      b.setCategory(Notification.CATEGORY_ALARM).setVisibility(Notification.VISIBILITY_PUBLIC)
+                  }
+                  return b.build()
+              }
+
+              private fun step() {
+                  val now = System.currentTimeMillis()
+                  val z = ZonedDateTime.now(AMMAN)
+                  val min = z.hour * 60 + z.minute; val day = z.toLocalDate().toString()
+                  when (phase) {
+                      "idle" -> { val t = PT.compute(z.toLocalDate())
+                          for (i in 0..4) if (t[i] == min && fired.add(day + i)) { prayer = NAMES[i]; snoozes = 0; ring(); break } }
+                      "snoozing" -> if (now >= until) { if (snoozes >= 2) lock() else ring() }
+                      "locked" -> if (now >= until) { phase = "idle"; nm().notify(1, notif("مذكّر الصلاة شغال", "s", false)) }
+                  }
+                  dhikr(now)
+              }
+
+              private fun ring() {
+                  phase = "ringing"
+                  nm().notify(1, notif("حان وقت صلاة $prayer", "a", true))
+                  stopAlarm()
+                  try {
+                      player = MediaPlayer().apply {
+                          setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_ALARM).build())
+                          setDataSource(this@PrayerService, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM))
+                          isLooping = true; prepare(); start()
+                      }
+                  } catch (e: Exception) {}
+              }
+
+              private fun stopAlarm() { try { player?.stop(); player?.release() } catch (e: Exception) {}; player = null }
+
+              private fun lock() {
+                  stopAlarm(); phase = "locked"; until = System.currentTimeMillis() + 7 * 60000
+                  prefs().edit().putLong("lockUntil", until).apply()
+                  nm().notify(1, notif("التطبيقات مقفولة 7 دقائق", "s", false))
+              }
+
+              private fun dhikr(now: Long) {
+                  if (!prefs().getBoolean("dhikr", true)) { nextD = 0; return }
+                  if (nextD == 0L) { nextD = now + 300000; return }
+                  if (now >= nextD) {
+                      nextD = now + 300000
+                      if (phase != "ringing" && ttsOk) {
+                          tts?.speak("صلِّ على النبي", TextToSpeech.QUEUE_ADD, null, "d1")
+                          tts?.speak("أستغفر الله", TextToSpeech.QUEUE_ADD, null, "d2")
+                      }
+                  }
+              }
+
+              override fun onStartCommand(i: Intent?, f: Int, s: Int): Int {
+                  when (i?.action) {
+                      GO -> lock()
+                      LATER -> { stopAlarm(); snoozes++; phase = "snoozing"; until = System.currentTimeMillis() + 15 * 60000
+                          nm().notify(1, notif("تذكير بعد ربع ساعة", "s", false)) }
+                      TEST -> { prayer = "تجريبية"; snoozes = 0; ring() }
+                  }
+                  return START_STICKY
+              }
+
+              override fun onDestroy() { stopAlarm(); tts?.shutdown(); super.onDestroy() }
+          }
+
+          class BlockerService : AccessibilityService() {
+              override fun onAccessibilityEvent(e: AccessibilityEvent) {
+                  val pk = e.packageName?.toString() ?: return
+                  val p = getSharedPreferences("p", 0)
+                  if (System.currentTimeMillis() < p.getLong("lockUntil", 0) && pk in (p.getStringSet("apps", emptySet()) ?: emptySet()))
+                      performGlobalAction(GLOBAL_ACTION_HOME)
+              }
+              override fun onInterrupt() {}
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent) { c.startForegroundService(Intent(c, PrayerService::class.java)) }
+          }
+
+          class MainActivity : Activity() {
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf("android.permission.POST_NOTIFICATIONS"), 1)
+                  startForegroundService(Intent(this, PrayerService::class.java))
+                  val p = getSharedPreferences("p", 0)
+                  val ll = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(40, 80, 40, 40); layoutDirection = View.LAYOUT_DIRECTION_RTL }
+                  fun btn(t: String, f: () -> Unit) { ll.addView(Button(this).apply { text = t; setOnClickListener { f() } }) }
+                  val t = PT.compute(ZonedDateTime.now(AMMAN).toLocalDate())
+                  ll.addView(TextView(this).apply { textSize = 20f
+                      text = "مواعيد اليوم - عمّان\n" + NAMES.indices.joinToString("\n") { "${NAMES[it]}: ${PT.fmt(t[it])}" } })
+                  ll.addView(CheckBox(this).apply { text = "ذكر كل 5 دقائق"; isChecked = p.getBoolean("dhikr", true)
+                      setOnCheckedChangeListener { _, c -> p.edit().putBoolean("dhikr", c).apply() } })
+                  btn("اختيار التطبيقات المقفولة") {
+                      val pm = packageManager
+                      val apps = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+                          .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }.distinct().sortedBy { it.second }
+                      val sel = (p.getStringSet("apps", emptySet()) ?: emptySet()).toMutableSet()
+                      AlertDialog.Builder(this).setTitle("اختر التطبيقات")
+                          .setMultiChoiceItems(apps.map { it.second }.toTypedArray(), BooleanArray(apps.size) { apps[it].first in sel }) { _, i, c ->
+                              if (c) sel.add(apps[i].first) else sel.remove(apps[i].first) }
+                          .setPositiveButton("حفظ") { _, _ -> p.edit().putStringSet("apps", sel).apply() }.show()
+                  }
+                  btn("تفعيل خدمة التسكير (Accessibility)") { startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }
+                  btn("السماح بالعمل بالخلفية") {
+                      startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).setData(Uri.parse("package:$packageName"))) }
+                  btn("جرّب الآن") { startForegroundService(Intent(this, PrayerService::class.java).setAction(PrayerService.TEST)) }
+                  setContentView(ScrollView(this).apply { addView(ll) })
+              }
+          }
+          EOF
+      - name: Build
+        run: cd proj && gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prayer-apk
+          path: proj/app/build/outputs/apk/debug/app-debug.apk
