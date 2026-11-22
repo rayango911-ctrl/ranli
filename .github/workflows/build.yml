@@ -115,6 +115,32 @@ jobs:
                           android:name="android.app.shortcuts"
                           android:resource="@xml/shortcuts" />
                   </activity>
+
+                  <service
+                      android:name=".RanliInteractionService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION">
+                      <meta-data
+                          android:name="android.voice_interaction"
+                          android:resource="@xml/voice_interaction_service" />
+                      <intent-filter>
+                          <action android:name="android.service.voice.VoiceInteractionService" />
+                      </intent-filter>
+                  </service>
+
+                  <service
+                      android:name=".RanliSessionService"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_VOICE_INTERACTION" />
+
+                  <service
+                      android:name=".RanliRecognitionService"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.speech.RecognitionService" />
+                          <category android:name="android.intent.category.DEFAULT" />
+                      </intent-filter>
+                  </service>
               </application>
           </manifest>
           EOF_4
@@ -125,6 +151,7 @@ jobs:
           import android.app.Activity
           import android.app.AlertDialog
           import android.content.ActivityNotFoundException
+          import android.content.ComponentName
           import android.content.ClipData
           import android.content.ClipboardManager
           import android.content.Context
@@ -139,7 +166,9 @@ jobs:
           import android.os.Looper
           import android.provider.ContactsContract
           import android.provider.ContactsContract.CommonDataKinds.Phone
+          import android.provider.Settings
           import android.speech.RecognitionListener
+          import android.speech.RecognitionService
           import android.speech.RecognizerIntent
           import android.speech.SpeechRecognizer
           import android.speech.tts.TextToSpeech
@@ -465,6 +494,18 @@ jobs:
                   }
               }
 
+              // نختار خدمة التعرف الصوتي الحقيقية (مش الفارغة اللي بتخص التطبيق)
+              private fun recognizerComponent(): ComponentName? {
+                  val def = Settings.Secure.getString(contentResolver, "voice_recognition_service")
+                  val dc = if (def.isNullOrBlank()) null else ComponentName.unflattenFromString(def)
+                  if (dc != null && dc.packageName != packageName) return dc
+                  val list = packageManager.queryIntentServices(Intent(RecognitionService.SERVICE_INTERFACE), 0)
+                  val others = list.filter { it.serviceInfo.packageName != packageName }
+                  val pick = others.firstOrNull { it.serviceInfo.packageName.contains("google") }
+                      ?: others.firstOrNull()
+                  return if (pick == null) null else ComponentName(pick.serviceInfo.packageName, pick.serviceInfo.name)
+              }
+
               private fun startCommandListening() {
                   listen { options -> handleSpeech(options) }
               }
@@ -476,7 +517,13 @@ jobs:
                   }
                   handler.post {
                       recognizer?.destroy()
-                      recognizer = SpeechRecognizer.createSpeechRecognizer(this).apply {
+                      val comp = recognizerComponent()
+                      val created = if (comp != null) {
+                          SpeechRecognizer.createSpeechRecognizer(this, comp)
+                      } else {
+                          SpeechRecognizer.createSpeechRecognizer(this)
+                      }
+                      recognizer = created.apply {
                           setRecognitionListener(object : RecognitionListener {
                               override fun onResults(results: Bundle?) {
                                   val list = results
@@ -909,7 +956,63 @@ jobs:
               }
           }
           EOF_5
-          cat > app/src/main/res/xml/shortcuts.xml << 'EOF_6'
+          cat > app/src/main/java/com/example/voicecall/Assistant.kt << 'EOF_6'
+          package com.example.voicecall
+
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.service.voice.VoiceInteractionService
+          import android.service.voice.VoiceInteractionSession
+          import android.service.voice.VoiceInteractionSessionService
+          import android.speech.RecognitionService
+          import android.speech.SpeechRecognizer
+
+          // هاي الكلاسات بتخلي "رنلي" يظهر بقائمة "تطبيق المساعد الرقمي" بالإعدادات.
+          // لما تضغط زر الطاقة مطولاً (أو سماعة البلوتوث)، النظام بيشغّل onShow.
+
+          class RanliInteractionService : VoiceInteractionService()
+
+          class RanliSessionService : VoiceInteractionSessionService() {
+              override fun onNewSession(args: Bundle?): VoiceInteractionSession = RanliSession(this)
+          }
+
+          class RanliSession(ctx: Context) : VoiceInteractionSession(ctx) {
+              override fun onShow(args: Bundle?, showFlags: Int) {
+                  super.onShow(args, showFlags)
+                  val i = Intent(context, MainActivity::class.java)
+                  i.action = "com.example.voicecall.LISTEN"
+                  i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+                  context.startActivity(i)
+                  hide()
+              }
+          }
+
+          // مطلوب من النظام مع خدمة المساعد، بس ما بنستخدمه للتعرف على الصوت
+          // (التعرف بيتم عن طريق خدمة جوجل الموجودة بالجهاز).
+          class RanliRecognitionService : RecognitionService() {
+              override fun onStartListening(recognizerIntent: Intent?, listener: RecognitionService.Callback?) {
+                  try {
+                      listener?.error(SpeechRecognizer.ERROR_CLIENT)
+                  } catch (e: Exception) {
+                      // تجاهل
+                  }
+              }
+
+              override fun onCancel(listener: RecognitionService.Callback?) {}
+
+              override fun onStopListening(listener: RecognitionService.Callback?) {}
+          }
+          EOF_6
+          cat > app/src/main/res/xml/voice_interaction_service.xml << 'EOF_7'
+          <?xml version="1.0" encoding="utf-8"?>
+          <voice-interaction-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:sessionService="com.example.voicecall.RanliSessionService"
+              android:recognitionService="com.example.voicecall.RanliRecognitionService"
+              android:supportsAssist="true"
+              android:supportsLaunchVoiceAssistFromKeyguard="true" />
+          EOF_7
+          cat > app/src/main/res/xml/shortcuts.xml << 'EOF_8'
           <?xml version="1.0" encoding="utf-8"?>
           <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
               <shortcut
@@ -924,13 +1027,13 @@ jobs:
                       android:targetClass="com.example.voicecall.MainActivity" />
               </shortcut>
           </shortcuts>
-          EOF_6
-          cat > app/src/main/res/values/strings.xml << 'EOF_7'
+          EOF_8
+          cat > app/src/main/res/values/strings.xml << 'EOF_9'
           <?xml version="1.0" encoding="utf-8"?>
           <resources>
               <string name="shortcut_listen">احكي</string>
           </resources>
-          EOF_7
+          EOF_9
           base64 -d > app/src/main/res/mipmap-xxxhdpi/ic_launcher.png << 'EOF_ICON'
           iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAMAAABlApw1AAABIFBMVEX+/P759v318f3s5fvh1vva
           y/zSxPbBrvGNcs5sOtt3KPtlKfBiHPZHF9o7Go0iF0wZEjsbEEQRESUPDyEODx8qDIYbDEsVDDcR
@@ -972,65 +1075,4 @@ jobs:
           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
-          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
-          BbL6bndgtk1MW0NB6Xwqnc1n87ujMfl
+          1Pji2mp/EJ3MPUmhXyMo+dVAc4LAOHIA/BATQhS1bOhHyVhcSmbZf6mXH0sl
